@@ -387,11 +387,15 @@ class IOSDriver(NetworkDriver):
                 merge_error = "Configuration merge failed; automatic rollback attempted"
                 raise MergeConfigException(merge_error)
 
-        # Save config to startup (both replace and merge)
-        output += self.device.send_command_expect("write mem")
+        if not confirmed:
+            # Save config to startup (both replace and merge)
+            output += self.device.send_command_expect("write mem")
 
     def commit_confirm(self):
+        # Confirm replacement of running-config with a new config file
         output = self.device.send_command_expect('configure confirm')
+        # Save config to startup (both replace and merge)
+        output += self.device.send_command_expect("write mem")
 
     def discard_config(self):
         """Set candidate_cfg to current running-config. Erase the merge_cfg file."""
