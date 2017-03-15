@@ -355,7 +355,7 @@ class IOSDriver(NetworkDriver):
             if self.auto_rollback_on_error:
                 cmd = 'configure replace {} force revert trigger error'.format(cfg_file)
             elif confirmed:
-                cmd = 'configure replace {} force time {}'.format(cfg_file, confirmed)
+                cmd = 'configure replace bootflash:{} force time {}'.format(cfg_file, confirmed)
             else:
                 cmd = 'configure replace {} force'.format(cfg_file)
             output = self._commit_hostname_handler(cmd)
@@ -379,7 +379,8 @@ class IOSDriver(NetworkDriver):
                 cmd = 'copy running-config {}'.format(self.candidate_cfg)
                 output += self.device.send_command_expect(cmd)
                 # Replace with the candidate and force rollback if not confirmed
-                cmd = 'configure replace {} force time {}'.format(self.candidate_cfg, confirmed)
+                cmd = 'configure replace bootflash:{} force time {}'.format(self.candidate_cfg,
+                                                                            confirmed)
                 output += self.device.send_command_expect(cmd)
             self._enable_confirm()
             if 'Invalid input detected' in output:
