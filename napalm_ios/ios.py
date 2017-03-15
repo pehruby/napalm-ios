@@ -371,17 +371,18 @@ class IOSDriver(NetworkDriver):
             cfg_file = self._gen_full_path(filename)
             if not self._check_file_exists(cfg_file):
                 raise MergeConfigException("Merge source config file does not exist")
-            cmd = 'copy {} running-config'.format(cfg_file)
             self._disable_confirm()
-            output = self._commit_hostname_handler(cmd)
             if confirmed:
-                # Create the candidate config file
-                cmd = 'copy running-config {}'.format(self.candidate_cfg)
-                output += self.device.send_command_expect(cmd)
-                # Replace with the candidate and force rollback if not confirmed
-                cmd = 'configure replace bootflash:{} force time {}'.format(self.candidate_cfg,
+                # Replace running config with the rollback config
+                # And schedule the revert time
+                # If not confirmed, it will go back to the current running-config state
+                cmd = 'configure replace bootflash:{} force time {}'.format(self.rollback_cfg,
                                                                             confirmed)
-                output += self.device.send_command_expect(cmd)
+                output = self.device.send_command_expect(cmd)
+                # The rest of the commands will be loaded directly through the normal
+                #   merge into the running-config
+            cmd = 'copy {} running-config'.format(cfg_file)
+            output = self._commit_hostname_handler(cmd)
             self._enable_confirm()
             if 'Invalid input detected' in output:
                 self.rollback()
@@ -393,7 +394,7 @@ class IOSDriver(NetworkDriver):
             output += self.device.send_command_expect("write mem")
 
     def commit_confirm(self):
-        # Confirm replacement of running-config with a new config file
+        # Confirm replacement of running-config
         output = self.device.send_command_expect('configure confirm')
         # Save config to startup (both replace and merge)
         output += self.device.send_command_expect("write mem")
