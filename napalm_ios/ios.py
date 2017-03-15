@@ -337,7 +337,7 @@ class IOSDriver(NetworkDriver):
                 output = ''
         return output
 
-    def commit_config(self):
+    def commit_config(self, confirmed=0):
         """
         If replacement operation, perform 'configure replace' for the entire config.
 
@@ -354,6 +354,8 @@ class IOSDriver(NetworkDriver):
                 raise ReplaceConfigException("Candidate config file does not exist")
             if self.auto_rollback_on_error:
                 cmd = 'configure replace {} force revert trigger error'.format(cfg_file)
+            elif confirmed:
+                cmd = 'configure replace {} force time {}'.format(cfg_file, confirmed)
             else:
                 cmd = 'configure replace {} force'.format(cfg_file)
             output = self._commit_hostname_handler(cmd)
@@ -372,6 +374,13 @@ class IOSDriver(NetworkDriver):
             cmd = 'copy {} running-config'.format(cfg_file)
             self._disable_confirm()
             output = self._commit_hostname_handler(cmd)
+            if confirmed:
+                # Create the candidate config file
+                cmd = 'copy running-config {}'.format(self.candidate_cfg)
+                output += self.device.send_command_expect(cmd)
+                # Replace with the candidate and force rollback if not confirmed
+                cmd = 'configure replace {} force time {}'.format(self.candidate_cfg, confirmed)
+                output += self.device.send_command_expect(cmd)
             self._enable_confirm()
             if 'Invalid input detected' in output:
                 self.rollback()
@@ -380,6 +389,9 @@ class IOSDriver(NetworkDriver):
 
         # Save config to startup (both replace and merge)
         output += self.device.send_command_expect("write mem")
+
+    def commit_confirm(self):
+        output = self.device.send_command_expect('configure confirm')
 
     def discard_config(self):
         """Set candidate_cfg to current running-config. Erase the merge_cfg file."""
