@@ -1161,6 +1161,10 @@ class IOSDriver(NetworkDriver):
         cmd_bgp_all_sum = 'show bgp all summary'
         summary_output = self._send_command(cmd_bgp_all_sum).strip()
 
+        # if BGP is not active, there are no neighbors
+        if not summary_output or 'BGP not active' in summary_output:
+            return {'global': {}}
+
         # get neighbor output from device
         neighbor_output = ''
         for afi in supported_afi:
