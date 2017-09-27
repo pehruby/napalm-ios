@@ -21,13 +21,13 @@ import os
 import uuid
 import socket
 import tempfile
+import telnetlib
 import copy
 
 from netmiko import ConnectHandler, FileTransfer, InLineTransfer
-from netmiko import __version__ as netmiko_version
 from napalm_base.base import NetworkDriver
 from napalm_base.exceptions import ReplaceConfigException, MergeConfigException, \
-            ConnectionClosedException
+            ConnectionClosedException, CommandErrorException
 
 from napalm_base.utils import py23_compat
 import napalm_base.constants as C
@@ -76,14 +76,19 @@ class IOSDriver(NetworkDriver):
         self.password = password
         self.timeout = timeout
 
+        self.transport = optional_args.get('transport', 'ssh')
+
         # Retrieve file names
         self.candidate_cfg = optional_args.get('candidate_cfg', 'candidate_config.txt')
         self.merge_cfg = optional_args.get('merge_cfg', 'merge_config.txt')
         self.rollback_cfg = optional_args.get('rollback_cfg', 'rollback_config.txt')
         self.inline_transfer = optional_args.get('inline_transfer', False)
+        if self.transport == 'telnet':
+            # Telnet only supports inline_transfer
+            self.inline_transfer = True
 
         # None will cause autodetection of dest_file_system
-        self.dest_file_system = optional_args.get('dest_file_system', None)
+        self._dest_file_system = optional_args.get('dest_file_system', None)
         self.auto_rollback_on_error = optional_args.get('auto_rollback_on_error', True)
 
         # Netmiko possible arguments
@@ -100,15 +105,8 @@ class IOSDriver(NetworkDriver):
             'alt_host_keys': False,
             'alt_key_file': '',
             'ssh_config_file': None,
+            'allow_agent': False,
         }
-
-        fields = netmiko_version.split('.')
-        fields = [int(x) for x in fields]
-        maj_ver, min_ver, bug_fix = fields
-        if maj_ver >= 2:
-            netmiko_argument_map['allow_agent'] = False
-        elif maj_ver == 1 and min_ver >= 1:
-            netmiko_argument_map['allow_agent'] = False
 
         # Build dict of any optional Netmiko args
         self.netmiko_optional_args = {}
@@ -117,8 +115,12 @@ class IOSDriver(NetworkDriver):
                 self.netmiko_optional_args[k] = optional_args[k]
             except KeyError:
                 pass
-        self.global_delay_factor = optional_args.get('global_delay_factor', 1)
-        self.port = optional_args.get('port', 22)
+
+        default_port = {
+            'ssh': 22,
+            'telnet': 23
+        }
+        self.port = optional_args.get('port', default_port[self.transport])
 
         self.device = None
         self.config_replace = False
@@ -128,19 +130,24 @@ class IOSDriver(NetworkDriver):
 
     def open(self):
         """Open a connection to the device."""
-        self.device = ConnectHandler(device_type='cisco_ios',
+        device_type = 'cisco_ios'
+        if self.transport == 'telnet':
+            device_type = 'cisco_ios_telnet'
+        self.device = ConnectHandler(device_type=device_type,
                                      host=self.hostname,
                                      username=self.username,
                                      password=self.password,
                                      **self.netmiko_optional_args)
         # ensure in enable mode
         self.device.enable()
-        if not self.dest_file_system:
-            try:
-                self.dest_file_system = self.device._autodetect_fs()
-            except AttributeError:
-                raise AttributeError("Netmiko _autodetect_fs not found please upgrade Netmiko or "
-                                     "specify dest_file_system in optional_args.")
+
+    def _discover_file_system(self):
+        try:
+            return self.device._autodetect_fs()
+        except Exception:
+            msg = "Netmiko _autodetect_fs failed (to workaround specify " \
+                  "dest_file_system in optional_args.)"
+            raise CommandErrorException(msg)
 
     def close(self):
         """Close the connection to the device."""
@@ -164,22 +171,31 @@ class IOSDriver(NetworkDriver):
             raise ConnectionClosedException(str(e))
 
     def is_alive(self):
-        """Returns a flag with the state of the SSH connection."""
+        """Returns a flag with the state of the connection."""
         null = chr(0)
-        try:
-            # Try sending ASCII null byte to maintain
-            #   the connection alive
-            self.device.send_command(null)
-        except (socket.error, EOFError):
-            # If unable to send, we can tell for sure
-            #   that the connection is unusable,
-            #   hence return False.
-            return {
-                'is_alive': False
-            }
-        return {
-            'is_alive': self.device.remote_conn.transport.is_active()
-        }
+        if self.device is None:
+            return {'is_alive': False}
+        if self.transport == 'telnet':
+            try:
+                # Try sending IAC + NOP (IAC is telnet way of sending command
+                # IAC = Interpret as Command (it comes before the NOP)
+                self.device.write_channel(telnetlib.IAC + telnetlib.NOP)
+                return {'is_alive': True}
+            except UnicodeDecodeError:
+                # Netmiko logging bug (remove after Netmiko >= 1.4.3)
+                return {'is_alive': True}
+            except AttributeError:
+                return {'is_alive': False}
+        else:
+            # SSH
+            try:
+                # Try sending ASCII null byte to maintain the connection alive
+                self.device.write_channel(null)
+                return {'is_alive': self.device.remote_conn.transport.is_active()}
+            except (socket.error, EOFError):
+                # If unable to send, we can tell for sure that the connection is unusable
+                return {'is_alive': False}
+        return {'is_alive': False}
 
     @staticmethod
     def _create_tmp_file(config):
@@ -411,7 +427,8 @@ class IOSDriver(NetworkDriver):
             self._enable_confirm()
             if 'Invalid input detected' in output:
                 self.rollback()
-                merge_error = "Configuration merge failed; automatic rollback attempted"
+                err_header = "Configuration merge failed; automatic rollback attempted"
+                merge_error = "{0}:\n{1}".format(err_header, output)
                 raise MergeConfigException(merge_error)
 
         # Save config to startup (both replace and merge)
@@ -434,6 +451,9 @@ class IOSDriver(NetworkDriver):
             raise ReplaceConfigException("Rollback config file does not exist")
         cmd = 'configure replace {} force'.format(cfg_file)
         self.device.send_command_expect(cmd)
+
+        # Save config to startup
+        self.device.send_command_expect("write mem")
 
     def _inline_tcl_xfer(self, source_file=None, source_config=None, dest_file=None,
                          file_system=None):
@@ -1042,6 +1062,8 @@ class IOSDriver(NetworkDriver):
                         if fields[2] == 'dhcp':
                             cmd = "show interface {} | in Internet address is".format(interface)
                             show_int = self._send_command(cmd)
+                            if not show_int:
+                                continue
                             int_fields = show_int.split()
                             ip_address, subnet = int_fields[3].split(r'/')
                             interfaces[interface]['ipv4'] = {ip_address: {}}
@@ -1778,7 +1800,9 @@ class IOSDriver(NetworkDriver):
         RE_MACTABLE_DEFAULT = r"^" + MAC_REGEX
         RE_MACTABLE_6500_1 = r"^\*\s+{}\s+{}\s+".format(VLAN_REGEX, MAC_REGEX)  # 7 fields
         RE_MACTABLE_6500_2 = r"^{}\s+{}\s+".format(VLAN_REGEX, MAC_REGEX)   # 6 fields
-        RE_MACTABLE_4500 = r"^{}\s+{}\s+".format(VLAN_REGEX, MAC_REGEX)     # 5 fields
+        RE_MACTABLE_6500_3 = r"^\s{51}\S+"                               # Fill down from prior
+        RE_MACTABLE_4500_1 = r"^{}\s+{}\s+".format(VLAN_REGEX, MAC_REGEX)     # 5 fields
+        RE_MACTABLE_4500_2 = r"^\s{32}\S+"                               # Fill down from prior
         RE_MACTABLE_2960_1 = r"^All\s+{}".format(MAC_REGEX)
         RE_MACTABLE_GEN_1 = r"^{}\s+{}\s+".format(VLAN_REGEX, MAC_REGEX)   # 4 fields (2960/4500)
 
@@ -1816,7 +1840,21 @@ class IOSDriver(NetworkDriver):
         output = "\n".join(output).strip()
         # Strip any leading astericks
         output = re.sub(r"^\*", "", output, flags=re.M)
+        fill_down_vlan = fill_down_mac = fill_down_mac_type = ''
         for line in output.splitlines():
+            # Cat6500 one off anf 4500 multicast format
+            if (re.search(RE_MACTABLE_6500_3, line) or re.search(RE_MACTABLE_4500_2, line)):
+                interface = line.strip()
+                if ',' in interface:
+                    interfaces = interface.split(',')
+                else:
+                    interfaces = []
+                    interfaces.append(interface)
+                for single_interface in interfaces:
+                    mac_address_table.append(process_mac_fields(fill_down_vlan, fill_down_mac,
+                                                                fill_down_mac_type,
+                                                                single_interface))
+                continue
             line = line.strip()
             if line == '':
                 continue
@@ -1838,9 +1876,18 @@ class IOSDriver(NetworkDriver):
                     _, vlan, mac, mac_type, _, _, interface = line.split()
                 elif len(line.split()) == 6:
                     vlan, mac, mac_type, _, _, interface = line.split()
-                mac_address_table.append(process_mac_fields(vlan, mac, mac_type, interface))
+                if ',' in interface:
+                    interfaces = interface.split(',')
+                    fill_down_vlan = vlan
+                    fill_down_mac = mac
+                    fill_down_mac_type = mac_type
+                    for single_interface in interfaces:
+                        mac_address_table.append(process_mac_fields(vlan, mac, mac_type,
+                                                                    single_interface))
+                else:
+                    mac_address_table.append(process_mac_fields(vlan, mac, mac_type, interface))
             # Cat4500 format
-            elif re.search(RE_MACTABLE_4500, line) and len(line.split()) == 5:
+            elif re.search(RE_MACTABLE_4500_1, line) and len(line.split()) == 5:
                 vlan, mac, mac_type, _, interface = line.split()
                 mac_address_table.append(process_mac_fields(vlan, mac, mac_type, interface))
             # Cat2960 format - ignore extra header line
@@ -1850,7 +1897,16 @@ class IOSDriver(NetworkDriver):
             elif (re.search(RE_MACTABLE_2960_1, line) or re.search(RE_MACTABLE_GEN_1, line)) and \
                     len(line.split()) == 4:
                 vlan, mac, mac_type, interface = line.split()
-                mac_address_table.append(process_mac_fields(vlan, mac, mac_type, interface))
+                if ',' in interface:
+                    interfaces = interface.split(',')
+                    fill_down_vlan = vlan
+                    fill_down_mac = mac
+                    fill_down_mac_type = mac_type
+                    for single_interface in interfaces:
+                        mac_address_table.append(process_mac_fields(vlan, mac, mac_type,
+                                                                    single_interface))
+                else:
+                    mac_address_table.append(process_mac_fields(vlan, mac, mac_type, interface))
             elif re.search(r"Total Mac Addresses", line):
                 continue
             elif re.search(r"Multicast Entries", line):
@@ -2132,3 +2188,10 @@ class IOSDriver(NetworkDriver):
             configs['running'] = output
 
         return configs
+
+    @property
+    def dest_file_system(self):
+        # The self.device check ensures napalm has an open connection
+        if self.device and self._dest_file_system is None:
+            self._dest_file_system = self._discover_file_system()
+        return self._dest_file_system
