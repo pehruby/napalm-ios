@@ -363,7 +363,10 @@ class IOSDriver(NetworkDriver):
             # merge
             cmd = 'show archive config incremental-diffs {} ignorecase'.format(new_file_full)
             diff = self.device.send_command_expect(cmd)
-            if '% Invalid' not in diff:
+            if 'error code 5' in diff or 'returned error 5' in diff:
+                diff = "You have encountered the obscure 'error 5' message. This generally " \
+                       "means you need to add an 'end' statement to the end of your merge changes."
+            elif '% Invalid' not in diff:
                 diff = self._normalize_merge_diff_incr(diff)
             else:
                 cmd = 'more {}'.format(new_file_full)
@@ -374,17 +377,13 @@ class IOSDriver(NetworkDriver):
 
     def _commit_hostname_handler(self, cmd):
         """Special handler for hostname change on commit operation."""
-        try:
-            current_prompt = self.device.find_prompt()
-            # Wait 12 seconds for output to come back (.2 * 60)
-            output = self.device.send_command_expect(cmd, delay_factor=.2, max_loops=60)
-        except IOError:
-            # Check if hostname change
-            if current_prompt == self.device.find_prompt():
-                raise
-            else:
-                self.device.set_base_prompt()
-                output = ''
+        current_prompt = self.device.find_prompt().strip()
+        terminating_char = current_prompt[-1]
+        pattern = r"[>#{}]\s*$".format(terminating_char)
+        # Look exclusively for trailing pattern that includes '#' and '>'
+        output = self.device.send_command_expect(cmd, expect_string=pattern)
+        # Reset base prompt in case hostname changed
+        self.device.set_base_prompt()
         return output
 
     def commit_config(self):
@@ -407,9 +406,9 @@ class IOSDriver(NetworkDriver):
             else:
                 cmd = 'configure replace {} force'.format(cfg_file)
             output = self._commit_hostname_handler(cmd)
-            if ('Failed to apply command' in output) or \
-               ('original configuration has been successfully restored' in output) or \
-               ('Error' in output):
+            if ('original configuration has been successfully restored' in output) or \
+               ('error' in output.lower()) or \
+               ('failed' in output.lower()):
                 msg = "Candidate config could not be applied\n{}".format(output)
                 raise ReplaceConfigException(msg)
             elif '%Please turn config archive on' in output:
@@ -861,7 +860,7 @@ class IOSDriver(NetworkDriver):
         # default values.
         vendor = u'Cisco'
         uptime = -1
-        serial_number, fqdn, os_version, hostname = (u'Unknown', u'Unknown', u'Unknown', u'Unknown')
+        serial_number, fqdn, os_version, hostname, domain_name = ('Unknown',) * 5
 
         # obtain output from device
         show_ver = self._send_command('show version')
@@ -965,18 +964,26 @@ class IOSDriver(NetworkDriver):
         interface_dict = {}
         for line in output.splitlines():
 
-            interface_regex = r"^(\S+?)\s+is\s+(.+?),\s+line\s+protocol\s+is\s+(\S+)"
-            if re.search(interface_regex, line):
-                interface_match = re.search(interface_regex, line)
-                interface = interface_match.groups()[0]
-                status = interface_match.groups()[1]
-                protocol = interface_match.groups()[2]
-
-                if 'admin' in status:
-                    is_enabled = False
-                else:
-                    is_enabled = True
-                is_up = bool('up' in protocol)
+            interface_regex_1 = r"^(\S+?)\s+is\s+(.+?),\s+line\s+protocol\s+is\s+(\S+)"
+            interface_regex_2 = r"^(\S+)\s+is\s+(up|down)"
+            for pattern in (interface_regex_1, interface_regex_2):
+                interface_match = re.search(pattern, line)
+                if interface_match:
+                    interface = interface_match.group(1)
+                    status = interface_match.group(2)
+                    try:
+                        protocol = interface_match.group(3)
+                    except IndexError:
+                        protocol = ''
+                    if 'admin' in status.lower():
+                        is_enabled = False
+                    else:
+                        is_enabled = True
+                    if protocol:
+                        is_up = bool('up' in protocol)
+                    else:
+                        is_up = bool('up' in status)
+                    break
 
             mac_addr_regex = r"^\s+Hardware.+address\s+is\s+({})".format(MAC_REGEX)
             if re.search(mac_addr_regex, line):
@@ -1028,7 +1035,7 @@ class IOSDriver(NetworkDriver):
                                 'ipv6': {   u'1::1': {   'prefix_length': 64},
                                             u'2001:DB8:1::1': {   'prefix_length': 64},
                                             u'2::': {   'prefix_length': 64},
-                                            u'FE80::3': {   'prefix_length': u'N/A'}}},
+                                            u'FE80::3': {   'prefix_length': 10}}},
             u'Tunnel0': {   'ipv4': {   u'10.63.100.9': {   'prefix_length': 24}}},
             u'Tunnel1': {   'ipv4': {   u'10.63.101.9': {   'prefix_length': 24}}},
             u'Vlan100': {   'ipv4': {   u'10.40.0.1': {   'prefix_length': 24},
@@ -1038,86 +1045,50 @@ class IOSDriver(NetworkDriver):
         """
         interfaces = {}
 
-        command = 'show ip interface brief'
-        output = self._send_command(command)
-        for line in output.splitlines():
-            if 'Interface' in line and 'Status' in line:
+        command = 'show ip interface'
+        show_ip_interface = self._send_command(command)
+        command = 'show ipv6 interface'
+        show_ipv6_interface = self._send_command(command)
+
+        INTERNET_ADDRESS = r'\s+(?:Internet address is|Secondary address)'
+        INTERNET_ADDRESS += r' (?P<ip>{})/(?P<prefix>\d+)'.format(IPV4_ADDR_REGEX)
+        LINK_LOCAL_ADDRESS = r'\s+IPv6 is enabled, link-local address is (?P<ip>[a-fA-F0-9:]+)'
+        GLOBAL_ADDRESS = r'\s+(?P<ip>[a-fA-F0-9:]+), subnet is (?:[a-fA-F0-9:]+)/(?P<prefix>\d+)'
+
+        interfaces = {}
+        for line in show_ip_interface.splitlines():
+            if(len(line.strip()) == 0):
                 continue
-            fields = line.split()
-            if len(fields) >= 3:
-                interface = fields[0]
-            else:
-                raise ValueError("Unexpected response from the router")
-            interfaces.update({interface: {}})
+            if(line[0] != ' '):
+                ipv4 = {}
+                interface_name = line.split()[0]
+            m = re.match(INTERNET_ADDRESS, line)
+            if m:
+                ip, prefix = m.groups()
+                ipv4.update({ip: {"prefix_length": int(prefix)}})
+                interfaces[interface_name] = {'ipv4': ipv4}
 
-        # Parse IP Address and Subnet Mask from Interfaces
-        for interface in interfaces:
-            show_command = "show run interface {0}".format(interface)
-            interface_output = self._send_command(show_command)
-            for line in interface_output.splitlines():
-                if 'ip address ' in line and 'no ip address' not in line:
-                    fields = line.split()
-                    if len(fields) == 3:
-                        # Check for 'ip address dhcp', convert to ip address and mask
-                        if fields[2] == 'dhcp':
-                            cmd = "show interface {} | in Internet address is".format(interface)
-                            show_int = self._send_command(cmd)
-                            if not show_int:
-                                continue
-                            int_fields = show_int.split()
-                            ip_address, subnet = int_fields[3].split(r'/')
-                            interfaces[interface]['ipv4'] = {ip_address: {}}
-                            try:
-                                val = {'prefix_length': int(subnet)}
-                            except ValueError:
-                                val = {'prefix_length': u'N/A'}
-                            interfaces[interface]['ipv4'][ip_address] = val
-                    elif len(fields) in [4, 5]:
-                        # Check for 'ip address 10.10.10.1 255.255.255.0'
-                        # Check for 'ip address 10.10.11.1 255.255.255.0 secondary'
-                        if 'ipv4' not in interfaces[interface].keys():
-                            interfaces[interface].update({'ipv4': {}})
-                        ip_address = fields[2]
+        for line in show_ipv6_interface.splitlines():
+            if(len(line.strip()) == 0):
+                continue
+            if(line[0] != ' '):
+                ifname = line.split()[0]
+                ipv6 = {}
+                if ifname not in interfaces:
+                    interfaces[ifname] = {'ipv6': ipv6}
+                else:
+                    interfaces[ifname].update({'ipv6': ipv6})
+            m = re.match(LINK_LOCAL_ADDRESS, line)
+            if m:
+                ip = m.group(1)
+                ipv6.update({ip: {"prefix_length": 10}})
+            m = re.match(GLOBAL_ADDRESS, line)
+            if m:
+                ip, prefix = m.groups()
+                ipv6.update({ip: {"prefix_length": int(prefix)}})
 
-                        try:
-                            subnet = sum([bin(int(x)).count('1') for x in fields[3].split('.')])
-                        except ValueError:
-                            subnet = u'N/A'
-
-                        ip_dict = {'prefix_length': subnet}
-                        interfaces[interface]['ipv4'].update({ip_address: {}})
-                        interfaces[interface]['ipv4'][ip_address].update(ip_dict)
-                    else:
-                        raise ValueError(u"Unexpected Response from the device")
-
-                # Check IPv6
-                if 'ipv6 address ' in line:
-                    fields = line.split()
-                    ip_address = fields[2]
-                    if 'ipv6' not in interfaces[interface].keys():
-                            interfaces[interface].update({'ipv6': {}})
-
-                    try:
-                        if r'/' in ip_address:
-                            # check for 'ipv6 address 1::1/64'
-                            ip_address, subnet = ip_address.split(r'/')
-                            interfaces[interface]['ipv6'].update({ip_address: {}})
-                            ip_dict = {'prefix_length': int(subnet)}
-                        else:
-                            # check for 'ipv6 address FE80::3 link-local'
-                            interfaces[interface]['ipv6'].update({ip_address: {}})
-                            ip_dict = {'prefix_length': u'N/A'}
-
-                        interfaces[interface]['ipv6'][ip_address].update(ip_dict)
-                    except AttributeError:
-                        raise ValueError(u"Unexpected Response from the device")
-
-        # remove keys with no data
-        new_interfaces = {}
-        for k, val in interfaces.items():
-            if val:
-                new_interfaces[k] = val
-        return new_interfaces
+        # Interface without ipv6 doesn't appears in show ipv6 interface
+        return interfaces
 
     @staticmethod
     def bgp_time_conversion(bgp_uptime):
@@ -1554,13 +1525,14 @@ class IOSDriver(NetworkDriver):
         """
         Get environment facts.
 
-        power, fan, temperature are currently not implemented
+        power and fan are currently not implemented
         cpu is using 1-minute average
         cpu hard-coded to cpu0 (i.e. only a single CPU)
         """
         environment = {}
         cpu_cmd = 'show proc cpu'
         mem_cmd = 'show memory statistics'
+        temp_cmd = 'show env temperature status'
 
         output = self._send_command(cpu_cmd)
         environment.setdefault('cpu', {})
@@ -1586,14 +1558,30 @@ class IOSDriver(NetworkDriver):
         environment['memory']['used_ram'] = used_mem
         environment['memory']['available_ram'] = free_mem
 
-        # Initialize 'power', 'fan', and 'temperature' to default values (not implemented)
+        environment.setdefault('temperature', {})
+        # The 'show env temperature status' is not ubiquitous in Cisco IOS
+        output = self._send_command(temp_cmd)
+        if '% Invalid' not in output:
+            for line in output.splitlines():
+                if 'System Temperature Value' in line:
+                    system_temp = float(line.split(':')[1].split()[0])
+                elif 'Yellow Threshold' in line:
+                    system_temp_alert = float(line.split(':')[1].split()[0])
+                elif 'Red Threshold' in line:
+                    system_temp_crit = float(line.split(':')[1].split()[0])
+            env_value = {'is_alert': system_temp >= system_temp_alert,
+                         'is_critical': system_temp >= system_temp_crit, 'temperature': system_temp}
+            environment['temperature']['system'] = env_value
+        else:
+            env_value = {'is_alert': False, 'is_critical': False, 'temperature': -1.0}
+            environment['temperature']['invalid'] = env_value
+
+        # Initialize 'power' and 'fan' to default values (not implemented)
         environment.setdefault('power', {})
         environment['power']['invalid'] = {'status': True, 'output': -1.0, 'capacity': -1.0}
         environment.setdefault('fans', {})
         environment['fans']['invalid'] = {'status': True}
-        environment.setdefault('temperature', {})
-        env_value = {'is_alert': False, 'is_critical': False, 'temperature': -1.0}
-        environment['temperature']['invalid'] = env_value
+
         return environment
 
     def get_arp_table(self):
