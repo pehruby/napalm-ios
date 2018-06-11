@@ -24,6 +24,7 @@ import tempfile
 import telnetlib
 import copy
 
+from netaddr import IPNetwork
 from netmiko import ConnectHandler, FileTransfer, InLineTransfer
 from napalm_base.base import NetworkDriver
 from napalm_base.exceptions import ReplaceConfigException, MergeConfigException, \
@@ -32,6 +33,8 @@ from napalm_base.exceptions import ReplaceConfigException, MergeConfigException,
 from napalm_base.utils import py23_compat
 import napalm_base.constants as C
 import napalm_base.helpers
+
+from netaddr.core import AddrFormatError
 
 
 # Easier to store these as constants
@@ -62,6 +65,53 @@ ASN_REGEX = r"[\d\.]+"
 IOS_COMMANDS = {
    'show_mac_address': ['show mac-address-table', 'show mac address-table'],
 }
+
+def bgp_time_conversion(bgp_uptime):
+        """Convert string time to seconds.
+        Examples
+        00:14:23
+        00:13:40
+        00:00:21
+        00:00:13
+        00:00:49
+        1d11h
+        1d17h
+        1w0d
+        8w5d
+        1y28w
+        never
+        """
+        bgp_uptime = bgp_uptime.strip()
+        uptime_letters = set(['w', 'h', 'd'])
+
+        if 'never' in bgp_uptime:
+            return -1
+        elif ':' in bgp_uptime:
+            times = bgp_uptime.split(":")
+            times = [int(x) for x in times]
+            hours, minutes, seconds = times
+            return (hours * 3600) + (minutes * 60) + seconds
+        # Check if any letters 'w', 'h', 'd' are in the time string
+        elif uptime_letters & set(bgp_uptime):
+            form1 = r'(\d+)d(\d+)h'  # 1d17h
+            form2 = r'(\d+)w(\d+)d'  # 8w5d
+            form3 = r'(\d+)y(\d+)w'  # 1y28w
+            match = re.search(form1, bgp_uptime)
+            if match:
+                days = int(match.group(1))
+                hours = int(match.group(2))
+                return (days * DAY_SECONDS) + (hours * 3600)
+            match = re.search(form2, bgp_uptime)
+            if match:
+                weeks = int(match.group(1))
+                days = int(match.group(2))
+                return (weeks * WEEK_SECONDS) + (days * DAY_SECONDS)
+            match = re.search(form3, bgp_uptime)
+            if match:
+                years = int(match.group(1))
+                weeks = int(match.group(2))
+                return (years * YEAR_SECONDS) + (weeks * WEEK_SECONDS)
+        raise ValueError("Unexpected value for BGP uptime string: {}".format(bgp_uptime))
 
 
 class IOSDriver(NetworkDriver):
@@ -1901,6 +1951,116 @@ class IOSDriver(NetworkDriver):
                 raise ValueError("Unexpected output from: {}".format(repr(line)))
 
         return mac_address_table
+
+    def _get_vrfs(self, ipv=''):
+        """
+        Returns list of all VRFs or VRFs where ipv4 or ipv6 is configured
+        param ipv can contain '','4' or '6'
+        """
+        vrfs = []
+
+        if ipv not in ['','4','6']:
+            return(vrfs)
+        command = 'show vrf'
+        output = self._send_command(command)
+
+        out_lines = output.split('\n')
+
+        for line in out_lines[1:]:
+            vrfstr = re.match(r"[ ]+(\S+)[ ]+[<> a-z:0-9]+[ ]+([a-z0-9,]+)",line)
+            if vrfstr:
+                if ipv == '' or ipv in vrfstr.group(2):
+                    vrfs.append(vrfstr.group(1))
+        
+        return(vrfs)
+
+
+
+
+
+
+
+    def get_route_to(self, destination='', protocol=''):
+        """
+        """
+
+        
+        output = []
+
+        # Placeholder for vrf arg
+        vrf = ''
+
+        try:
+            ipv = ''
+            if IPNetwork(destination).version == 6:
+                ipv = 'v6'
+        except AddrFormatError:
+            return 'Please specify a valid destination!'
+        
+        if ipv == '':           # IPv4
+            
+            if vrf == '':
+                vrfs = sorted(self._get_vrfs('4'))
+            else:
+                vrfs = [vrf]
+            vrfs.append('default')
+            ipnet_dest = IPNetwork(destination)
+            prefix = str(ipnet_dest.network)
+            netmask = str(ipnet_dest.netmask)
+            routes = {destination:[]}
+            commands = []
+            for _vrf in vrfs:
+                if _vrf == 'default':
+                    commands.append('show ip route {prefix} {netmask}'.format(
+                        prefix=prefix,
+                        netmask=netmask,
+                    ))
+                else:
+                    commands.append('show ip route vrf {vrf} {prefix} {netmask}'.format(
+                        vrf=_vrf,
+                        prefix=prefix,
+                        netmask=netmask,
+                    ))
+            for cmditem in commands:
+                outvrf = self._send_command(cmditem)
+                output.append(outvrf)
+            
+            for (outitem, _vrf) in zip(output, vrfs):
+                route_proto_regex = re.search('Known via \"(\S+)', outitem)
+                if route_proto_regex:
+                    route_proto = route_proto_regex.group(1)
+                    rdb = outitem.split('Routing Descriptor Blocks:')
+                    for rdbline in rdb[1].split('\n'):
+                        matchstr = re.match(r"[ ]+([*| ]?)[ ](\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}), from \d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}, ([0-9a-z:]+) ago(, via (\S+))?",rdbline)
+                        if matchstr:
+                            nh = matchstr.group(2)
+                            ageraw = matchstr.group(3)
+                            if route_proto != "bgp":
+                                viaraw = matchstr.group(5)
+                            else:
+                                viaraw = ''
+                            continue
+                        matchstr = re.match(r"[ ]+Route metric is ([0-9]+)", rdbline)
+                        if matchstr:
+                            rmetric = matchstr.group(1)
+                            route_entry = {
+                                "protocol":route_proto,
+                                "outgoing_interface":viaraw,       # napalm_base.helpers.canonical_interface_name(viaraw)
+                                "age":bgp_time_conversion(ageraw),                      # napalm_base.helpers.convert(int,ageraw),
+                                "current_active":True,
+                                "routing_table":_vrf,
+                                "last_active":False,
+                                "protocol_attributes":{  
+                        
+                                },
+                                "next_hop":napalm_base.helpers.ip(nh),
+                                "selected_next_hop":False,
+                                "inactive_reason":"",
+                                "preference":rmetric
+                            }
+                            routes[destination].append(route_entry)
+        return(routes)
+
 
     def get_snmp_information(self):
         """
